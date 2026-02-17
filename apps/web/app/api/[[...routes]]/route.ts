@@ -2,10 +2,13 @@ import { Hono } from "hono";
 import { handle } from "hono/vercel";
 import { zValidator } from "@hono/zod-validator";
 import { z } from "zod";
+import { put } from "@vercel/blob";
 
 export const runtime = "nodejs";
 
 const app = new Hono().basePath("/api");
+
+const gamesStore = new Map<string, any>();
 
 // Health check
 app.get("/health", (c) => {
@@ -22,29 +25,43 @@ const listGamesQuery = z.object({
 // 게임 목록
 app.get("/games", zValidator("query", listGamesQuery), async (c) => {
   const { page, limit, sort } = c.req.valid("query");
-  // TODO: DB에서 조회 (MVP는 in-memory)
+
+  const allGames = Array.from(gamesStore.values());
+  const sorted = allGames.sort((a, b) => {
+    if (sort === "popular") return b.downloadCount - a.downloadCount;
+    return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+  });
+
+  const start = (page - 1) * limit;
+  const games = sorted.slice(start, start + limit);
+
   return c.json({
-    games: [],
-    total: 0,
+    games,
+    total: allGames.length,
     page,
     limit,
-    hasMore: false,
+    hasMore: start + limit < allGames.length,
   });
 });
 
 // 게임 상세
 app.get("/games/:id", async (c) => {
   const id = c.req.param("id");
-  // TODO: DB에서 조회
-  return c.json(
-    {
-      error: {
-        code: "GAME_NOT_FOUND",
-        message: "Game not found",
+  const game = gamesStore.get(id);
+
+  if (!game) {
+    return c.json(
+      {
+        error: {
+          code: "GAME_NOT_FOUND",
+          message: "Game not found",
+        },
       },
-    },
-    404
-  );
+      404
+    );
+  }
+
+  return c.json(game);
 });
 
 // 게임 업로드 스키마
@@ -72,25 +89,64 @@ app.post("/games", zValidator("form", uploadGameSchema), async (c) => {
     );
   }
 
-  // TODO: Vercel Blob에 업로드
-  // TODO: In-memory 저장소에 게임 정보 저장
+  const id = crypto.randomUUID();
+  const now = new Date().toISOString();
 
-  return c.json(
-    {
-      id: crypto.randomUUID(),
-      name,
-      description,
-      pckUrl: "https://example.blob.vercel-storage.com/...",
-    },
-    201
-  );
+  // Vercel Blob에 PCK 파일 업로드
+  const pckBlob = await put(`games/${id}/${pckFile.name}`, pckFile, {
+    access: "public",
+  });
+
+  // 썸네일 업로드 (있으면)
+  let thumbnailUrl = null;
+  const thumbnailFile = body["thumbnail"] as File | undefined;
+  if (thumbnailFile) {
+    const thumbnailBlob = await put(`games/${id}/thumbnail`, thumbnailFile, {
+      access: "public",
+    });
+    thumbnailUrl = thumbnailBlob.url;
+  }
+
+  const game = {
+    id,
+    name,
+    description: description || "",
+    pckUrl: pckBlob.url,
+    pckSize: pckFile.size,
+    thumbnailUrl,
+    screenshots: [],
+    tags: tags || [],
+    downloadCount: 0,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  gamesStore.set(id, game);
+
+  return c.json(game, 201);
 });
 
 // PCK 다운로드
 app.get("/games/:id/download", async (c) => {
   const id = c.req.param("id");
-  // TODO: DB에서 PCK URL 조회 후 리다이렉트
-  return c.redirect("https://example.blob.vercel-storage.com/...");
+  const game = gamesStore.get(id);
+
+  if (!game) {
+    return c.json(
+      {
+        error: {
+          code: "GAME_NOT_FOUND",
+          message: "Game not found",
+        },
+      },
+      404
+    );
+  }
+
+  game.downloadCount++;
+  gamesStore.set(id, game);
+
+  return c.redirect(game.pckUrl);
 });
 
 export const GET = handle(app);
